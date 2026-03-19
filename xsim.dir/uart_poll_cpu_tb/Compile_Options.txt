@@ -1,0 +1,1 @@
+"uart_poll_cpu_tb" -s "uart_poll_cpu_tb" 

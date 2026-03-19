@@ -1,0 +1,24 @@
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+
+stages:
+  - build
+
+bitstream:
+  stage: build
+  tags:
+    - cod24-ci-runner
+  script:
+    - /opt/Xilinx/Vivado/2024.2/bin/vivado -mode tcl -source .ci-scripts/bits.tcl thinpad_top.xpr
+    - python3 ./.ci-scripts/run-linter.py thinpad_top.xpr 2>linter.log
+    - test -f thinpad_top.runs/impl_1/*.bit
+    - mv thinpad_top.runs runs
+    - rm -rf thinpad*
+
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    when: always
+    paths:
+      - runs/impl_1/*.bit
+      - runs/*/runme.log
+      - linter.log

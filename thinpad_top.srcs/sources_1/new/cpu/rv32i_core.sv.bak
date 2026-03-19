@@ -1,0 +1,1330 @@
+`timescale 1ns/1ps
+`default_nettype none
+
+module rv32i_core #(
+  parameter logic [31:0] RESET_VECTOR = 32'h8000_0000
+) (
+  input  wire        clk,
+  input  wire        rst,
+
+  // Wishbone master interface
+  output logic [31:0] wbm_adr_o,
+  output logic [31:0] wbm_dat_o,
+  input  wire [31:0] wbm_dat_i,
+  output logic        wbm_we_o,
+  output logic [3:0]  wbm_sel_o,
+  output logic        wbm_cyc_o,
+  output logic        wbm_stb_o,
+  input  wire        wbm_ack_i,
+  input  wire        wbm_err_i,
+
+  // Debug
+  output logic [31:0] dbg_pc,
+  output logic [31:0] dbg_instr
+);
+
+  // ------------------------------------------------------------
+  // Enumerations and helper typedefs
+  // ------------------------------------------------------------
+
+  typedef enum logic [5:0] {
+    ALU_ADD,
+    ALU_SUB,
+    ALU_SLL,
+    ALU_SLT,
+    ALU_SLTU,
+    ALU_XOR,
+    ALU_SRL,
+    ALU_SRA,
+    ALU_OR,
+    ALU_AND,
+    ALU_PASS_B,
+    ALU_MINU,
+    ALU_XNOR,
+    ALU_CTZ
+  } alu_op_e;
+
+  typedef enum logic [2:0] {
+    BR_NONE,
+    BR_EQ,
+    BR_NE,
+    BR_LT,
+    BR_GE,
+    BR_LTU,
+    BR_GEU
+  } branch_e;
+
+  typedef enum logic [1:0] {
+    OP_A_RS1,
+    OP_A_PC,
+    OP_A_ZERO
+  } op_a_sel_e;
+
+  typedef enum logic [2:0] {
+    OP_B_RS2,
+    OP_B_IMM,
+    OP_B_FOUR
+  } op_b_sel_e;
+
+  typedef enum logic [1:0] {
+    WB_SRC_ALU,
+    WB_SRC_MEM,
+    WB_SRC_PC4,
+    WB_SRC_CSR
+  } wb_src_e;
+
+  typedef enum logic [1:0] {
+    MEM_SIZE_BYTE,
+    MEM_SIZE_HALF,
+    MEM_SIZE_WORD
+  } mem_size_e;
+
+  typedef enum logic [1:0] {
+    CSR_OP_WRITE,
+    CSR_OP_SET,
+    CSR_OP_CLEAR
+  } csr_op_e;
+
+  typedef enum logic [1:0] {
+    BUS_IDLE,
+    BUS_IFETCH,
+    BUS_MEM
+  } bus_state_e;
+
+  typedef struct packed {
+    logic        valid;
+    logic [31:0] pc;
+    logic [31:0] instr;
+  } if_id_reg_t;
+
+  typedef struct packed {
+    logic        valid;
+    logic [31:0] pc;
+    logic [31:0] instr;
+    logic [31:0] imm;
+    logic [4:0]  rd;
+    logic [4:0]  rs1;
+    logic [4:0]  rs2;
+    logic [31:0] rs1_value;
+    logic [31:0] rs2_value;
+    op_a_sel_e   op_a_sel;
+    op_b_sel_e   op_b_sel;
+    alu_op_e     alu_op;
+    branch_e     branch;
+    logic        jump;
+    logic        jalr;
+    logic        mem_read;
+    logic        mem_write;
+    mem_size_e   mem_size;
+    logic        mem_unsigned;
+    logic        reg_write;
+    wb_src_e     wb_src;
+  logic        csr_en;
+  csr_op_e     csr_op;
+    logic        csr_imm;
+    logic [11:0] csr_addr;
+    logic [31:0] csr_rdata;
+  logic [31:0] csr_operand;
+    logic        is_ecall;
+    logic        is_ebreak;
+    logic        is_mret;
+    logic        illegal;
+    logic        use_rs1;
+    logic        use_rs2;
+  } id_ex_reg_t;
+
+  typedef struct packed {
+    logic        valid;
+    logic [31:0] pc;
+    logic [31:0] pc_plus4;
+    logic [4:0]  rd;
+    logic        reg_write;
+    wb_src_e     wb_src;
+    logic        mem_read;
+    logic        mem_write;
+    mem_size_e   mem_size;
+    logic        mem_unsigned;
+    logic [31:0] alu_result;
+    logic [31:0] rs2_value;
+    logic [31:0] branch_target;
+    logic        branch_taken;
+    logic        jump;
+    logic        jalr;
+    logic        csr_en;
+    logic        csr_write_en;
+    logic [31:0] csr_wdata;
+    logic [31:0] csr_rdata;
+    logic [11:0] csr_addr;
+    logic        is_ecall;
+    logic        is_ebreak;
+    logic        is_mret;
+    logic        illegal;
+    logic        trap_valid;
+    logic [4:0]  trap_cause;
+    logic [31:0] trap_value;
+    logic [31:0] mem_addr;
+    logic [3:0]  store_sel;
+    logic [31:0] store_data;
+  } ex_mem_reg_t;
+
+  typedef struct packed {
+    logic        valid;
+    logic [4:0]  rd;
+    logic        reg_write;
+    wb_src_e     wb_src;
+    logic [31:0] alu_result;
+    logic [31:0] mem_data;
+    logic [31:0] pc_plus4;
+    logic [31:0] csr_data;
+  } mem_wb_reg_t;
+
+  // Reset values replaced by '0 in logic
+
+
+  // ------------------------------------------------------------
+  // Local parameters for opcodes and CSR constants
+  // ------------------------------------------------------------
+
+  localparam logic [6:0] OPCODE_OP        = 7'b0110011;
+  localparam logic [6:0] OPCODE_OP_IMM    = 7'b0010011;
+  localparam logic [6:0] OPCODE_LUI       = 7'b0110111;
+  localparam logic [6:0] OPCODE_AUIPC     = 7'b0010111;
+  localparam logic [6:0] OPCODE_JAL       = 7'b1101111;
+  localparam logic [6:0] OPCODE_JALR      = 7'b1100111;
+  localparam logic [6:0] OPCODE_BRANCH    = 7'b1100011;
+  localparam logic [6:0] OPCODE_LOAD      = 7'b0000011;
+  localparam logic [6:0] OPCODE_STORE     = 7'b0100011;
+  localparam logic [6:0] OPCODE_MISC_MEM  = 7'b0001111;
+  localparam logic [6:0] OPCODE_SYSTEM    = 7'b1110011;
+
+  localparam logic [31:0] CSR_MISA_VALUE = 32'h4000_0102;  // RV32IB
+
+  localparam logic [4:0] CAUSE_INSTR_ADDR_MISALIGNED = 5'd0;
+  localparam logic [4:0] CAUSE_INSTR_ACCESS_FAULT    = 5'd1;
+  localparam logic [4:0] CAUSE_ILLEGAL_INSTRUCTION   = 5'd2;
+  localparam logic [4:0] CAUSE_BREAKPOINT            = 5'd3;
+  localparam logic [4:0] CAUSE_LOAD_ADDR_MISALIGNED  = 5'd4;
+  localparam logic [4:0] CAUSE_LOAD_ACCESS_FAULT     = 5'd5;
+  localparam logic [4:0] CAUSE_STORE_ADDR_MISALIGNED = 5'd6;
+  localparam logic [4:0] CAUSE_STORE_ACCESS_FAULT    = 5'd7;
+  localparam logic [4:0] CAUSE_ECALL_M               = 5'd11;
+
+  // ------------------------------------------------------------
+  // Pipeline registers and state
+  // ------------------------------------------------------------
+
+  if_id_reg_t  if_id_reg;
+  id_ex_reg_t  id_ex_reg;
+  ex_mem_reg_t ex_mem_reg;
+  mem_wb_reg_t mem_wb_reg;
+
+  // Fetch/PC state
+  logic [31:0] pc_reg;
+  logic [31:0] fetch_pc_inflight;
+  logic [31:0] fetch_data_instr;
+  logic [31:0] fetch_data_pc;
+  logic        fetch_data_valid;
+  logic        fetch_inflight;
+  logic        fetch_discard;
+
+  // Wishbone state
+  bus_state_e  bus_state;
+  logic [31:0] bus_addr_reg;
+  logic [31:0] bus_wdata_reg;
+  logic [3:0]  bus_sel_reg;
+  logic        bus_we_reg;
+
+  assign wbm_adr_o = bus_addr_reg;
+  assign wbm_dat_o = bus_wdata_reg;
+  assign wbm_sel_o = bus_sel_reg;
+  assign wbm_we_o  = bus_we_reg;
+  assign wbm_cyc_o = (bus_state != BUS_IDLE);
+  assign wbm_stb_o = (bus_state != BUS_IDLE);
+
+  // Register file wiring
+  logic [4:0]  rs1_addr_id;
+  logic [4:0]  rs2_addr_id;
+  logic [31:0] rs1_data_id;
+  logic [31:0] rs2_data_id;
+  logic [31:0] regfile_rdata1;
+  logic [31:0] regfile_rdata2;
+  logic        regfile_we;
+  logic [4:0]  regfile_waddr;
+  logic [31:0] regfile_wdata;
+
+  assign rs1_addr_id = if_id_reg.instr[19:15];
+  assign rs2_addr_id = if_id_reg.instr[24:20];
+
+  rv32i_regfile u_regfile (
+      .clk   (clk),
+      .rst   (rst),
+      .we    (regfile_we),
+      .waddr (regfile_waddr),
+      .wdata (regfile_wdata),
+      .raddr1(rs1_addr_id),
+      .raddr2(rs2_addr_id),
+      .rdata1(regfile_rdata1),
+      .rdata2(regfile_rdata2)
+  );
+
+  assign regfile_we    = mem_wb_reg.valid && mem_wb_reg.reg_write && (mem_wb_reg.rd != 5'd0);
+  assign regfile_waddr = mem_wb_reg.rd;
+
+  // WB -> ID Forwarding
+  always_comb begin
+    rs1_data_id = regfile_rdata1;
+    if (regfile_we && (regfile_waddr == rs1_addr_id) && (rs1_addr_id != 5'd0)) begin
+      rs1_data_id = regfile_wdata;
+    end
+
+    rs2_data_id = regfile_rdata2;
+    if (regfile_we && (regfile_waddr == rs2_addr_id) && (rs2_addr_id != 5'd0)) begin
+      rs2_data_id = regfile_wdata;
+    end
+  end
+
+  always_comb begin
+    case (mem_wb_reg.wb_src)
+      WB_SRC_MEM: regfile_wdata = mem_wb_reg.mem_data;
+      WB_SRC_PC4: regfile_wdata = mem_wb_reg.pc_plus4;
+      WB_SRC_CSR: regfile_wdata = mem_wb_reg.csr_data;
+      default:    regfile_wdata = mem_wb_reg.alu_result;
+    endcase
+  end
+
+  // ------------------------------------------------------------
+  // CSR registers
+  // ------------------------------------------------------------
+
+  logic [31:0] csr_mstatus;
+  logic [31:0] csr_mtvec;
+  logic [31:0] csr_mepc;
+  logic [31:0] csr_mcause;
+  logic [31:0] csr_mscratch;
+  logic [31:0] csr_mie;
+  logic [31:0] csr_mip;
+  logic [31:0] csr_mtval;
+  logic [31:0] csr_mcounteren;
+  logic [31:0] csr_mcycle;
+  logic [31:0] csr_minstret;
+
+  // ------------------------------------------------------------
+  // Forwarding and control signals
+  // ------------------------------------------------------------
+
+  logic [31:0] id_rs1_value;
+  logic [31:0] id_rs2_value;
+  logic [31:0] ex_rs1_value;
+  logic [31:0] ex_rs2_value;
+  logic [31:0] alu_operand_a;
+  logic [31:0] alu_operand_b;
+  logic [31:0] alu_result;
+
+  logic        load_use_hazard;
+  logic        mem_busy;
+  logic        branch_flush;
+  logic        trap_flush;
+  logic        stall_if;
+  logic        stall_id;
+  logic        stall_ex;
+
+  logic        branch_taken_ex;
+  logic [31:0] branch_target_ex;
+
+  logic        mem_request_active;
+  logic        ex_mem_request_done;
+  logic        mem_response_valid;
+  logic [31:0] mem_response_data;
+  logic        mem_response_error;
+  logic        mem_transaction_done;
+  logic        mem_transaction_error;
+  logic [31:0] mem_transaction_data;
+  logic        mem_active_is_load;
+  logic [31:0] mem_active_pc;
+  logic [31:0] mem_active_addr;
+  logic        fetch_data_take;
+  logic        mem_commit;
+  logic [31:0] mem_load_data;
+  logic [3:0]  store_sel_comb;
+  logic [31:0] store_data_comb;
+  logic [31:0] csr_write_value;
+  logic        csr_write_enable_ex;
+  logic [31:0] csr_operand_value;
+  logic [31:0] pc_plus4_ex;
+
+  logic        instr_bus_error;
+  logic [31:0] instr_error_pc;
+
+  logic        trap_request;
+  logic [31:0] trap_cause_value;
+  logic [31:0] trap_tval_value;
+  logic [31:0] trap_target_pc;
+  logic [31:0] trap_mepc_value;
+  logic [31:0] mtvec_base;
+  logic [31:0] csr_mstatus_trap_value;
+  logic [31:0] csr_mstatus_mret_value;
+
+  assign mtvec_base = {csr_mtvec[31:2], 2'b00};
+
+  always_comb begin
+    csr_mstatus_trap_value = csr_mstatus;
+    csr_mstatus_trap_value[7]  = csr_mstatus[3];  // MPIE <= MIE
+    csr_mstatus_trap_value[3]  = 1'b0;            // MIE <= 0
+    csr_mstatus_trap_value[12:11] = 2'b11;        // MPP <= 11 (M-mode)
+
+    csr_mstatus_mret_value = csr_mstatus;
+    csr_mstatus_mret_value[3]  = csr_mstatus[7];  // MIE <= MPIE
+    csr_mstatus_mret_value[7]  = 1'b1;            // MPIE <= 1
+    csr_mstatus_mret_value[12:11] = 2'b00;        // MPP <= U-mode (unused)
+  end
+
+  // Decode control signals
+  logic        id_reg_write;
+  logic        id_mem_read;
+  logic        id_mem_write;
+  mem_size_e   id_mem_size;
+  logic        id_mem_unsigned;
+  op_a_sel_e   id_op_a_sel;
+  op_b_sel_e   id_op_b_sel;
+  alu_op_e     id_alu_op;
+  branch_e     id_branch;
+  logic        id_jump;
+  logic        id_jalr;
+  wb_src_e     id_wb_src;
+  logic        id_csr_en;
+  csr_op_e     id_csr_op;
+  logic        id_csr_imm;
+  logic [11:0] id_csr_addr;
+  logic [31:0] id_csr_rdata;
+  logic        id_is_ecall;
+  logic        id_is_ebreak;
+  logic        id_is_mret;
+  logic        id_illegal;
+  logic        id_use_rs1;
+  logic        id_use_rs2;
+  logic [31:0] id_imm_value;
+
+  wire        id_valid  = if_id_reg.valid;
+  wire [31:0] id_instr  = if_id_reg.instr;
+  wire [31:0] id_pc     = if_id_reg.pc;
+  wire [6:0]  id_opcode = id_instr[6:0];
+  wire [2:0]  id_funct3 = id_instr[14:12];
+  wire [6:0]  id_funct7 = id_instr[31:25];
+  wire [4:0]  id_shamt  = id_instr[24:20];
+  wire [11:0] id_csr_field = id_instr[31:20];
+
+  assign id_rs1_value = rs1_data_id;
+  assign id_rs2_value = rs2_data_id;
+  assign csr_operand_value = id_csr_imm ? {27'h0, id_instr[19:15]} : id_rs1_value;
+
+  always_comb begin
+    id_reg_write   = 1'b0;
+    id_mem_read    = 1'b0;
+    id_mem_write   = 1'b0;
+    id_mem_size    = MEM_SIZE_WORD;
+    id_mem_unsigned= 1'b0;
+    id_op_a_sel    = OP_A_RS1;
+    id_op_b_sel    = OP_B_RS2;
+    id_alu_op      = ALU_ADD;
+    id_branch      = BR_NONE;
+    id_jump        = 1'b0;
+    id_jalr        = 1'b0;
+    id_wb_src      = WB_SRC_ALU;
+    id_csr_en      = 1'b0;
+    id_csr_op      = CSR_OP_WRITE;
+    id_csr_imm     = 1'b0;
+    id_csr_addr    = id_csr_field;
+    id_csr_rdata   = csr_read(id_csr_addr);
+    id_is_ecall    = 1'b0;
+    id_is_ebreak   = 1'b0;
+    id_is_mret     = 1'b0;
+    id_illegal     = id_valid;  // assume illegal when valid unless overwritten
+    id_use_rs1     = 1'b0;
+    id_use_rs2     = 1'b0;
+    id_imm_value   = 32'h0;
+
+    if (!id_valid) begin
+      id_illegal = 1'b0;
+    end else begin
+      unique case (id_opcode)
+        OPCODE_LUI: begin
+          id_reg_write = 1'b1;
+          id_op_a_sel  = OP_A_ZERO;
+          id_op_b_sel  = OP_B_IMM;
+          id_alu_op    = ALU_PASS_B;
+          id_imm_value = imm_u(id_instr);
+          id_illegal   = 1'b0;
+        end
+        OPCODE_AUIPC: begin
+          id_reg_write = 1'b1;
+          id_op_a_sel  = OP_A_PC;
+          id_op_b_sel  = OP_B_IMM;
+          id_alu_op    = ALU_ADD;
+          id_imm_value = imm_u(id_instr);
+          id_illegal   = 1'b0;
+        end
+        OPCODE_JAL: begin
+          id_reg_write = 1'b1;
+          id_jump      = 1'b1;
+          id_wb_src    = WB_SRC_PC4;
+          id_op_a_sel  = OP_A_PC;
+          id_op_b_sel  = OP_B_IMM;
+          id_alu_op    = ALU_ADD;
+          id_imm_value = imm_j(id_instr);
+          id_illegal   = 1'b0;
+        end
+        OPCODE_JALR: begin
+          id_reg_write = 1'b1;
+          id_jump      = 1'b1;
+          id_jalr      = 1'b1;
+          id_wb_src    = WB_SRC_PC4;
+          id_op_a_sel  = OP_A_RS1;
+          id_op_b_sel  = OP_B_IMM;
+          id_alu_op    = ALU_ADD;
+          id_imm_value = imm_i(id_instr);
+          id_use_rs1   = 1'b1;
+          id_illegal   = 1'b0;
+        end
+        OPCODE_BRANCH: begin
+          id_use_rs1   = 1'b1;
+          id_use_rs2   = 1'b1;
+          id_imm_value = imm_b(id_instr);
+          id_illegal   = 1'b0;
+          unique case (id_funct3)
+            3'b000: id_branch = BR_EQ;
+            3'b001: id_branch = BR_NE;
+            3'b100: id_branch = BR_LT;
+            3'b101: id_branch = BR_GE;
+            3'b110: id_branch = BR_LTU;
+            3'b111: id_branch = BR_GEU;
+            default: id_illegal = 1'b1;
+          endcase
+        end
+        OPCODE_LOAD: begin
+          id_reg_write = 1'b1;
+          id_mem_read  = 1'b1;
+          id_wb_src    = WB_SRC_MEM;
+          id_op_a_sel  = OP_A_RS1;
+          id_op_b_sel  = OP_B_IMM;
+          id_alu_op    = ALU_ADD;
+          id_imm_value = imm_i(id_instr);
+          id_use_rs1   = 1'b1;
+          id_illegal   = 1'b0;
+          unique case (id_funct3)
+            3'b000: begin id_mem_size = MEM_SIZE_BYTE; id_mem_unsigned = 1'b0; end
+            3'b001: begin id_mem_size = MEM_SIZE_HALF; id_mem_unsigned = 1'b0; end
+            3'b010: begin id_mem_size = MEM_SIZE_WORD; id_mem_unsigned = 1'b0; end
+            3'b100: begin id_mem_size = MEM_SIZE_BYTE; id_mem_unsigned = 1'b1; end
+            3'b101: begin id_mem_size = MEM_SIZE_HALF; id_mem_unsigned = 1'b1; end
+            default: id_illegal = 1'b1;
+          endcase
+        end
+        OPCODE_STORE: begin
+          id_mem_write = 1'b1;
+          id_op_a_sel  = OP_A_RS1;
+          id_op_b_sel  = OP_B_IMM;
+          id_alu_op    = ALU_ADD;
+          id_imm_value = imm_s(id_instr);
+          id_use_rs1   = 1'b1;
+          id_use_rs2   = 1'b1;
+          id_illegal   = 1'b0;
+          unique case (id_funct3)
+            3'b000: id_mem_size = MEM_SIZE_BYTE;
+            3'b001: id_mem_size = MEM_SIZE_HALF;
+            3'b010: id_mem_size = MEM_SIZE_WORD;
+            default: id_illegal = 1'b1;
+          endcase
+        end
+        OPCODE_OP_IMM: begin
+          id_reg_write = 1'b1;
+          id_op_a_sel  = OP_A_RS1;
+          id_op_b_sel  = OP_B_IMM;
+          id_use_rs1   = 1'b1;
+          id_imm_value = imm_i(id_instr);
+          id_illegal   = 1'b0;
+          unique case (id_funct3)
+            3'b000: id_alu_op = ALU_ADD;  // ADDI
+            3'b010: id_alu_op = ALU_SLT;
+            3'b011: id_alu_op = ALU_SLTU;
+            3'b100: id_alu_op = ALU_XOR;
+            3'b110: id_alu_op = ALU_OR;
+            3'b111: id_alu_op = ALU_AND;
+            3'b001: begin
+              if (id_funct7 == 7'b0000000) begin
+                id_alu_op = ALU_SLL;
+              end else if ((id_funct7 == 7'b0110000) && (id_instr[24:20] == 5'b00001)) begin
+                id_alu_op = ALU_CTZ;
+                id_illegal = 1'b0;
+              end else begin
+                id_illegal = 1'b1;
+              end
+            end
+            3'b101: begin
+              if (id_funct7 == 7'b0000000) id_alu_op = ALU_SRL;
+              else if (id_funct7 == 7'b0100000) id_alu_op = ALU_SRA;
+              else id_illegal = 1'b1;
+            end
+            default: id_illegal = 1'b1;
+          endcase
+        end
+        OPCODE_OP: begin
+          id_reg_write = 1'b1;
+          id_op_a_sel  = OP_A_RS1;
+          id_op_b_sel  = OP_B_RS2;
+          id_use_rs1   = 1'b1;
+          id_use_rs2   = 1'b1;
+          id_illegal   = 1'b0;
+          unique case ({id_funct7, id_funct3})
+            10'b0000000_000: id_alu_op = ALU_ADD;
+            10'b0100000_000: id_alu_op = ALU_SUB;
+            10'b0000000_001: id_alu_op = ALU_SLL;
+            10'b0000000_010: id_alu_op = ALU_SLT;
+            10'b0000000_011: id_alu_op = ALU_SLTU;
+            10'b0000000_100: id_alu_op = ALU_XOR;
+            10'b0100000_100: id_alu_op = ALU_XNOR;  // XNOR
+            10'b0000000_101: id_alu_op = ALU_SRL;
+            10'b0100000_101: id_alu_op = ALU_SRA;
+            10'b0000000_110: id_alu_op = ALU_OR;
+            10'b0000000_111: id_alu_op = ALU_AND;
+            default: id_illegal = 1'b1;
+          endcase
+
+          // Bitmanip overrides
+          if ((id_funct7 == 7'b0000101) && (id_funct3 == 3'b110)) begin
+            id_alu_op  = ALU_MINU;
+            id_illegal = 1'b0;
+          end
+        end
+        OPCODE_MISC_MEM: begin
+          // fence/fence.i treated as NOP
+          id_illegal = 1'b0;
+        end
+        OPCODE_SYSTEM: begin
+          id_illegal = 1'b0;
+          if (id_funct3 == 3'b000) begin
+            case (id_instr[31:20])
+              12'h000: id_is_ecall  = 1'b1;
+              12'h001: id_is_ebreak = 1'b1;
+              12'h302: id_is_mret   = 1'b1;
+              default: id_illegal   = 1'b1;
+            endcase
+          end else begin
+            id_csr_en   = 1'b1;
+            id_csr_addr = id_csr_field;
+            id_csr_rdata= csr_read(id_csr_addr);
+            if (!csr_legal(id_csr_addr)) begin
+              id_illegal = 1'b1;
+            end else begin
+              logic csr_write_attempt;
+
+              id_reg_write = 1'b1;
+              id_wb_src    = WB_SRC_CSR;
+              id_use_rs1   = (id_funct3[2] == 1'b0);
+              id_csr_imm   = id_funct3[2];
+              unique case (id_funct3[1:0])
+                2'b01: id_csr_op = CSR_OP_WRITE;
+                2'b10: id_csr_op = CSR_OP_SET;
+                2'b11: id_csr_op = CSR_OP_CLEAR;
+                default: id_illegal = 1'b1;
+              endcase
+
+              csr_write_attempt = 1'b0;
+              if (id_illegal == 1'b0) begin
+                if (id_funct3[1:0] == 2'b01) begin
+                  csr_write_attempt = 1'b1;  // CSRRW/CSRRWI always write
+                end else begin
+                  if (id_csr_imm)
+                    csr_write_attempt = |id_instr[19:15];
+                  else
+                    csr_write_attempt = (id_instr[19:15] != 5'd0);
+                end
+
+                if (csr_is_readonly(id_csr_addr) && csr_write_attempt) begin
+                  id_illegal = 1'b1;
+                end
+              end
+            end
+          end
+        end
+        default: begin
+          id_illegal = 1'b1;
+        end
+      endcase
+    end
+  end
+
+  // 检测load-use hazard，包括lb指令
+  assign load_use_hazard = id_ex_reg.valid && id_ex_reg.mem_read && (id_ex_reg.rd != 5'd0) &&
+                           ((id_use_rs1 && (id_ex_reg.rd == if_id_reg.instr[19:15])) ||
+                            (id_use_rs2 && (id_ex_reg.rd == if_id_reg.instr[24:20])));
+
+  assign stall_ex = mem_busy || mem_request_active;
+  assign stall_id = stall_ex || load_use_hazard;
+  assign stall_if = stall_id;
+  assign branch_flush = id_ex_reg.valid && branch_taken_ex && !trap_flush;
+  assign fetch_data_take = fetch_data_valid && !stall_id && !trap_flush && !branch_flush;
+
+  // Forwarding
+  logic [31:0] ex_mem_forward_value;
+  logic [31:0] mem_wb_forward_value;
+
+  always_comb begin
+    // 确保load指令在MEM阶段的数据正确转发
+    unique case (ex_mem_reg.wb_src)
+      WB_SRC_MEM: ex_mem_forward_value = mem_load_data;
+      WB_SRC_PC4: ex_mem_forward_value = ex_mem_reg.pc_plus4;
+      WB_SRC_CSR: ex_mem_forward_value = ex_mem_reg.csr_rdata;
+      default:    ex_mem_forward_value = ex_mem_reg.alu_result;
+    endcase
+
+    // 确保load指令在WB阶段的数据正确转发
+    unique case (mem_wb_reg.wb_src)
+      WB_SRC_MEM: mem_wb_forward_value = mem_wb_reg.mem_data;
+      WB_SRC_PC4: mem_wb_forward_value = mem_wb_reg.pc_plus4;
+      WB_SRC_CSR: mem_wb_forward_value = mem_wb_reg.csr_data;
+      default:    mem_wb_forward_value = mem_wb_reg.alu_result;
+    endcase
+  end
+
+  always_comb begin
+    ex_rs1_value = id_ex_reg.rs1_value;
+    // 优先级：EX/MEM转发 > MEM/WB转发 > 寄存器文件值
+    if (id_ex_reg.use_rs1 && ex_mem_reg.valid && ex_mem_reg.reg_write && (ex_mem_reg.rd != 5'd0) &&
+        (ex_mem_reg.rd == id_ex_reg.rs1)) begin
+      ex_rs1_value = ex_mem_forward_value;
+    end else if (id_ex_reg.use_rs1 && mem_wb_reg.valid && mem_wb_reg.reg_write && (mem_wb_reg.rd != 5'd0) &&
+                 (mem_wb_reg.rd == id_ex_reg.rs1)) begin
+      ex_rs1_value = mem_wb_forward_value;
+    end
+
+    ex_rs2_value = id_ex_reg.rs2_value;
+    // 优先级：EX/MEM转发 > MEM/WB转发 > 寄存器文件值
+    if (id_ex_reg.use_rs2 && ex_mem_reg.valid && ex_mem_reg.reg_write && (ex_mem_reg.rd != 5'd0) &&
+        (ex_mem_reg.rd == id_ex_reg.rs2)) begin
+      ex_rs2_value = ex_mem_forward_value;
+    end else if (id_ex_reg.use_rs2 && mem_wb_reg.valid && mem_wb_reg.reg_write && (mem_wb_reg.rd != 5'd0) &&
+                 (mem_wb_reg.rd == id_ex_reg.rs2)) begin
+      ex_rs2_value = mem_wb_forward_value;
+    end
+  end
+
+  always_comb begin
+    case (id_ex_reg.op_a_sel)
+      OP_A_PC:   alu_operand_a = id_ex_reg.pc;
+      OP_A_ZERO: alu_operand_a = 32'h0;
+      default:   alu_operand_a = ex_rs1_value;
+    endcase
+
+    case (id_ex_reg.op_b_sel)
+      OP_B_IMM:  alu_operand_b = id_ex_reg.imm;
+      OP_B_FOUR: alu_operand_b = 32'd4;
+      default:   alu_operand_b = ex_rs2_value;
+    endcase
+
+    case (id_ex_reg.alu_op)
+      ALU_ADD:   alu_result = alu_operand_a + alu_operand_b;
+      ALU_SUB:   alu_result = alu_operand_a - alu_operand_b;
+      ALU_SLL:   alu_result = alu_operand_a << alu_operand_b[4:0];
+      ALU_SLT:   alu_result = ($signed(alu_operand_a) < $signed(alu_operand_b)) ? 32'd1 : 32'd0;
+      ALU_SLTU:  alu_result = (alu_operand_a < alu_operand_b) ? 32'd1 : 32'd0;
+      ALU_XOR:   alu_result = alu_operand_a ^ alu_operand_b;
+      ALU_XNOR:  alu_result = ~(alu_operand_a ^ alu_operand_b);
+      ALU_SRL:   alu_result = alu_operand_a >> alu_operand_b[4:0];
+      ALU_SRA:   alu_result = $signed(alu_operand_a) >>> alu_operand_b[4:0];
+      ALU_OR:    alu_result = alu_operand_a | alu_operand_b;
+      ALU_AND:   alu_result = alu_operand_a & alu_operand_b;
+      ALU_PASS_B:alu_result = alu_operand_b;
+      ALU_MINU:  alu_result = (alu_operand_a < alu_operand_b) ? alu_operand_a : alu_operand_b;
+      ALU_CTZ:   alu_result = ctz32(ex_rs1_value);
+      default:   alu_result = 32'h0;
+    endcase
+  end
+
+  always_comb begin
+    store_sel_comb  = 4'b0000;
+    store_data_comb = 32'h0;
+    case (id_ex_reg.mem_size)
+      MEM_SIZE_BYTE: begin
+        store_sel_comb  = 4'b0001 << alu_result[1:0];
+        store_data_comb = {4{ex_rs2_value[7:0]}} << (8 * alu_result[1:0]);
+      end
+      MEM_SIZE_HALF: begin
+        store_sel_comb  = alu_result[1] ? 4'b1100 : 4'b0011;
+        store_data_comb = {2{ex_rs2_value[15:0]}} << (16 * alu_result[1]);
+      end
+      MEM_SIZE_WORD: begin
+        store_sel_comb  = 4'b1111;
+        store_data_comb = ex_rs2_value;
+      end
+    endcase
+  end
+
+  always_comb begin
+    csr_write_value     = id_ex_reg.csr_rdata;
+    csr_write_enable_ex = 1'b0;
+
+    if (id_ex_reg.csr_en) begin
+      csr_write_enable_ex = 1'b1;
+      unique case (id_ex_reg.csr_op)
+        CSR_OP_WRITE: csr_write_value = id_ex_reg.csr_operand;
+        CSR_OP_SET:   csr_write_value = id_ex_reg.csr_rdata | id_ex_reg.csr_operand;
+        CSR_OP_CLEAR: csr_write_value = id_ex_reg.csr_rdata & ~id_ex_reg.csr_operand;
+      endcase
+      if ((id_ex_reg.csr_op != CSR_OP_WRITE) && (id_ex_reg.csr_operand == 32'h0)) begin
+        csr_write_enable_ex = 1'b0;  // pure read when operand is zero
+      end
+    end
+  end
+
+  always_comb begin
+    branch_taken_ex = 1'b0;
+    branch_target_ex = id_ex_reg.pc + id_ex_reg.imm;
+
+    case (id_ex_reg.branch)
+      BR_EQ:  branch_taken_ex = (ex_rs1_value == ex_rs2_value);
+      BR_NE:  branch_taken_ex = (ex_rs1_value != ex_rs2_value);
+      BR_LT:  branch_taken_ex = ($signed(ex_rs1_value) < $signed(ex_rs2_value));
+      BR_GE:  branch_taken_ex = ($signed(ex_rs1_value) >= $signed(ex_rs2_value));
+      BR_LTU: branch_taken_ex = (ex_rs1_value < ex_rs2_value);
+      BR_GEU: branch_taken_ex = (ex_rs1_value >= ex_rs2_value);
+      default: ;
+    endcase
+
+    if (id_ex_reg.jump) begin
+      branch_taken_ex = 1'b1;
+      if (id_ex_reg.jalr)
+        branch_target_ex = (ex_rs1_value + id_ex_reg.imm) & 32'hFFFF_FFFE;
+      else
+        branch_target_ex = id_ex_reg.pc + id_ex_reg.imm;
+    end
+
+    if (id_ex_reg.is_mret) begin
+      branch_taken_ex = 1'b1;
+      branch_target_ex = csr_mepc;
+    end
+  end
+
+  assign pc_plus4_ex = id_ex_reg.pc + 32'd4;
+
+  logic ex_trap_valid;
+  logic [4:0] ex_trap_cause;
+  logic [31:0] ex_trap_tval;
+
+  wire instr_bus_trap_valid = instr_bus_error;
+  wire mem_bus_trap_valid   = mem_transaction_error;
+  wire [4:0] mem_bus_trap_cause = mem_active_is_load ? CAUSE_LOAD_ACCESS_FAULT : CAUSE_STORE_ACCESS_FAULT;
+  wire [31:0] mem_bus_trap_tval = mem_active_addr;
+
+  always_comb begin
+    trap_request     = 1'b0;
+    trap_cause_value = 32'h0;
+    trap_tval_value  = 32'h0;
+    trap_target_pc   = mtvec_base;
+    trap_mepc_value  = 32'h0;
+
+    if (ex_trap_valid) begin
+      trap_request     = 1'b1;
+      trap_cause_value = {27'h0, ex_trap_cause};
+      trap_tval_value  = ex_trap_tval;
+      trap_mepc_value  = id_ex_reg.pc;
+    end else if (instr_bus_trap_valid) begin
+      trap_request     = 1'b1;
+      trap_cause_value = {27'h0, CAUSE_INSTR_ACCESS_FAULT};
+      trap_tval_value  = instr_error_pc;
+      trap_mepc_value  = instr_error_pc;
+    end else if (mem_bus_trap_valid) begin
+      trap_request     = 1'b1;
+      trap_cause_value = {27'h0, mem_bus_trap_cause};
+      trap_tval_value  = mem_bus_trap_tval;
+      trap_mepc_value  = mem_active_pc;
+    end else begin
+      trap_request = 1'b0;
+    end
+  end
+
+  assign trap_flush = trap_request;
+
+  always_comb begin
+    ex_trap_valid = 1'b0;
+    ex_trap_cause = CAUSE_ILLEGAL_INSTRUCTION;
+    ex_trap_tval  = 32'h0;
+
+    if (id_ex_reg.valid) begin
+      if (id_ex_reg.illegal) begin
+        ex_trap_valid = 1'b1;
+        ex_trap_cause = CAUSE_ILLEGAL_INSTRUCTION;
+        ex_trap_tval  = id_ex_reg.instr;
+      end else if (id_ex_reg.is_ecall) begin
+        ex_trap_valid = 1'b1;
+        ex_trap_cause = CAUSE_ECALL_M;
+        ex_trap_tval  = 32'h0;
+      end else if (id_ex_reg.is_ebreak) begin
+        ex_trap_valid = 1'b1;
+        ex_trap_cause = CAUSE_BREAKPOINT;
+        ex_trap_tval  = id_ex_reg.pc;
+      end else if (id_ex_reg.jump && id_ex_reg.jalr && |branch_target_ex[1:0]) begin
+        ex_trap_valid = 1'b1;
+        ex_trap_cause = CAUSE_INSTR_ADDR_MISALIGNED;
+        ex_trap_tval  = branch_target_ex;
+      end else if (id_ex_reg.mem_read || id_ex_reg.mem_write) begin
+        logic misaligned;
+        misaligned = 1'b0;
+        case (id_ex_reg.mem_size)
+          MEM_SIZE_HALF: misaligned = alu_result[0];
+          MEM_SIZE_WORD: misaligned = |alu_result[1:0];
+          default: misaligned = 1'b0;
+        endcase
+        if (misaligned) begin
+          ex_trap_valid = 1'b1;
+          ex_trap_cause = id_ex_reg.mem_read ? CAUSE_LOAD_ADDR_MISALIGNED : CAUSE_STORE_ADDR_MISALIGNED;
+          ex_trap_tval  = alu_result;
+        end
+      end
+    end
+  end
+
+  assign mem_request_active = ex_mem_reg.valid && (ex_mem_reg.mem_read || ex_mem_reg.mem_write) &&
+                              !mem_busy && !ex_mem_reg.trap_valid && !ex_mem_request_done &&
+                              !mem_transaction_done;
+
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      bus_state           <= BUS_IDLE;
+      bus_addr_reg        <= 32'h0;
+      bus_wdata_reg       <= 32'h0;
+      bus_sel_reg         <= 4'h0;
+      bus_we_reg          <= 1'b0;
+      pc_reg              <= RESET_VECTOR;
+      fetch_inflight      <= 1'b0;
+      fetch_data_valid    <= 1'b0;
+      fetch_discard       <= 1'b0;
+      mem_busy            <= 1'b0;
+      mem_transaction_done<= 1'b0;
+      mem_transaction_error <= 1'b0;
+      mem_response_valid  <= 1'b0;
+      mem_response_error  <= 1'b0;
+      instr_bus_error     <= 1'b0;
+      mem_response_data   <= 32'h0;
+      mem_transaction_data<= 32'h0;
+  mem_active_is_load  <= 1'b0;
+  mem_active_pc       <= 32'h0;
+  mem_active_addr     <= 32'h0;
+    end else begin
+      mem_transaction_done  <= 1'b0;
+      mem_transaction_error <= 1'b0;
+      mem_response_valid    <= 1'b0;
+      mem_response_error    <= 1'b0;
+      instr_bus_error       <= 1'b0;
+
+      if (trap_flush) begin
+        pc_reg <= trap_target_pc;
+        fetch_data_valid <= 1'b0;
+        fetch_discard <= fetch_inflight;
+      end else if (branch_flush) begin
+        pc_reg <= branch_target_ex;
+        fetch_data_valid <= 1'b0;
+        fetch_discard <= fetch_inflight;
+      end else begin
+        case (bus_state)
+          BUS_IDLE: begin
+          if (mem_request_active) begin
+            bus_state    <= BUS_MEM;
+            bus_addr_reg <= ex_mem_reg.mem_addr;
+            bus_wdata_reg<= ex_mem_reg.store_data;
+            bus_sel_reg  <= ex_mem_reg.store_sel;
+            bus_we_reg   <= ex_mem_reg.mem_write;
+            mem_busy     <= 1'b1;
+              mem_active_is_load <= ex_mem_reg.mem_read;
+              mem_active_pc      <= ex_mem_reg.pc;
+              mem_active_addr    <= ex_mem_reg.mem_addr;
+          end else if (!fetch_inflight && !fetch_data_valid && !trap_flush && !branch_flush) begin
+            bus_state        <= BUS_IFETCH;
+            bus_addr_reg     <= pc_reg;
+            bus_wdata_reg    <= 32'h0;
+            bus_sel_reg      <= 4'b1111;
+            bus_we_reg       <= 1'b0;
+            fetch_inflight   <= 1'b1;
+            fetch_pc_inflight<= pc_reg;
+            pc_reg           <= pc_reg + 32'd4;
+          end
+          end
+          BUS_IFETCH: begin
+          if (wbm_ack_i) begin
+            bus_state    <= BUS_IDLE;
+            fetch_inflight <= 1'b0;
+            if (!fetch_discard) begin
+              fetch_data_instr <= wbm_dat_i;
+              fetch_data_pc    <= fetch_pc_inflight;
+              fetch_data_valid <= 1'b1;
+            end else begin
+              fetch_discard <= 1'b0;
+            end
+          end
+          if (wbm_err_i) begin
+            bus_state      <= BUS_IDLE;
+            fetch_inflight <= 1'b0;
+            fetch_discard  <= 1'b0;
+            instr_bus_error<= 1'b1;
+            instr_error_pc <= fetch_pc_inflight;
+          end
+          end
+          BUS_MEM: begin
+          if (wbm_ack_i) begin
+            bus_state           <= BUS_IDLE;
+            mem_busy            <= 1'b0;
+            mem_transaction_done<= 1'b1;
+            if (!bus_we_reg) begin
+              mem_transaction_data <= wbm_dat_i;
+              mem_response_data    <= wbm_dat_i;
+              mem_response_valid   <= 1'b1;
+            end
+          end
+          if (wbm_err_i) begin
+            bus_state            <= BUS_IDLE;
+            mem_busy             <= 1'b0;
+            mem_transaction_error<= 1'b1;
+            mem_response_error   <= 1'b1;
+          end
+          end
+        endcase
+      end
+      if (fetch_data_take) begin
+        fetch_data_valid <= 1'b0;
+      end
+    end
+  end
+
+  // ------------------------------------------------------------
+  // Pipeline register updates
+  // ------------------------------------------------------------
+
+  // IF/ID
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      if_id_reg <= '{default: '0};
+    end else if (trap_flush) begin
+      if_id_reg.valid <= 1'b0;
+    end else if (branch_flush) begin
+      if_id_reg.valid <= 1'b0;
+    end else if (!stall_id) begin
+      if (fetch_data_take) begin
+        if_id_reg.valid <= 1'b1;
+        if_id_reg.pc    <= fetch_data_pc;
+        if_id_reg.instr <= fetch_data_instr;
+      end else begin
+        if_id_reg.valid <= 1'b0;
+      end
+    end
+  end
+
+  // ID/EX
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      id_ex_reg <= '0;
+    end else if (trap_flush) begin
+      id_ex_reg.valid <= 1'b0;
+    end else if (!stall_ex) begin
+      if (branch_flush) begin
+        id_ex_reg <= '0;
+      end else if (load_use_hazard) begin
+        // 当检测到load-use hazard时，插入一个气泡而不是重置整个寄存器
+        id_ex_reg.valid <= 1'b0;
+      end else begin
+        if (if_id_reg.valid) begin
+          id_ex_reg.valid       <= 1'b1;
+          id_ex_reg.pc          <= id_pc;
+          id_ex_reg.instr       <= id_instr;
+          id_ex_reg.imm         <= id_imm_value;
+          id_ex_reg.rd          <= id_instr[11:7];
+          id_ex_reg.rs1         <= id_instr[19:15];
+          id_ex_reg.rs2         <= id_instr[24:20];
+          id_ex_reg.rs1_value   <= id_rs1_value;
+          id_ex_reg.rs2_value   <= id_rs2_value;
+          id_ex_reg.op_a_sel    <= id_op_a_sel;
+          id_ex_reg.op_b_sel    <= id_op_b_sel;
+          id_ex_reg.alu_op      <= id_alu_op;
+          id_ex_reg.branch      <= id_branch;
+          id_ex_reg.jump        <= id_jump;
+          id_ex_reg.jalr        <= id_jalr;
+          id_ex_reg.mem_read    <= id_mem_read;
+          id_ex_reg.mem_write   <= id_mem_write;
+          id_ex_reg.mem_size    <= id_mem_size;
+          id_ex_reg.mem_unsigned<= id_mem_unsigned;
+          id_ex_reg.reg_write   <= id_reg_write;
+          id_ex_reg.wb_src      <= id_wb_src;
+          id_ex_reg.csr_en      <= id_csr_en;
+          id_ex_reg.csr_op      <= id_csr_op;
+          id_ex_reg.csr_imm     <= id_csr_imm;
+          id_ex_reg.csr_addr    <= id_csr_addr;
+          id_ex_reg.csr_rdata   <= id_csr_rdata;
+          id_ex_reg.csr_operand <= csr_operand_value;
+          id_ex_reg.is_ecall    <= id_is_ecall;
+          id_ex_reg.is_ebreak   <= id_is_ebreak;
+          id_ex_reg.is_mret     <= id_is_mret;
+          id_ex_reg.illegal     <= id_illegal;
+          id_ex_reg.use_rs1     <= id_use_rs1;
+          id_ex_reg.use_rs2     <= id_use_rs2;
+        end else begin
+          id_ex_reg <= '0;
+        end
+      end
+    end
+  end
+
+  // EX/MEM
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      ex_mem_reg          <= '0;
+      ex_mem_request_done <= 1'b0;
+    end else if (trap_flush) begin
+      ex_mem_reg.valid      <= 1'b0;
+      ex_mem_reg.trap_valid <= 1'b0;
+      ex_mem_request_done   <= 1'b0;
+    end else begin
+      if (!mem_busy && !mem_request_active) begin
+      ex_mem_reg.valid        <= id_ex_reg.valid;
+      ex_mem_reg.pc           <= id_ex_reg.pc;
+      ex_mem_reg.pc_plus4     <= pc_plus4_ex;
+      ex_mem_reg.rd           <= id_ex_reg.rd;
+      ex_mem_reg.reg_write    <= id_ex_reg.reg_write;
+      ex_mem_reg.wb_src       <= id_ex_reg.wb_src;
+      ex_mem_reg.mem_read     <= id_ex_reg.mem_read;
+      ex_mem_reg.mem_write    <= id_ex_reg.mem_write;
+      ex_mem_reg.mem_size     <= id_ex_reg.mem_size;
+      ex_mem_reg.mem_unsigned <= id_ex_reg.mem_unsigned;
+      ex_mem_reg.alu_result   <= alu_result;
+      ex_mem_reg.rs2_value    <= ex_rs2_value;
+      ex_mem_reg.branch_target<= branch_target_ex;
+      ex_mem_reg.branch_taken <= branch_taken_ex;
+      ex_mem_reg.jump         <= id_ex_reg.jump;
+      ex_mem_reg.jalr         <= id_ex_reg.jalr;
+      ex_mem_reg.csr_en       <= id_ex_reg.csr_en;
+      ex_mem_reg.csr_write_en <= csr_write_enable_ex;
+      ex_mem_reg.csr_wdata    <= csr_write_value;
+      ex_mem_reg.csr_rdata    <= id_ex_reg.csr_rdata;
+      ex_mem_reg.csr_addr     <= id_ex_reg.csr_addr;
+      ex_mem_reg.is_ecall     <= id_ex_reg.is_ecall;
+      ex_mem_reg.is_ebreak    <= id_ex_reg.is_ebreak;
+      ex_mem_reg.is_mret      <= id_ex_reg.is_mret;
+      ex_mem_reg.illegal      <= id_ex_reg.illegal;
+      ex_mem_reg.trap_valid   <= ex_trap_valid;
+      ex_mem_reg.trap_cause   <= ex_trap_cause;
+      ex_mem_reg.trap_value   <= ex_trap_tval;
+      ex_mem_reg.mem_addr     <= alu_result;
+      ex_mem_reg.store_sel    <= store_sel_comb;
+      ex_mem_reg.store_data   <= store_data_comb;
+      ex_mem_request_done     <= 1'b0;
+      end
+
+      if (mem_transaction_done) begin
+        ex_mem_request_done <= 1'b1;
+      end
+    end
+  end
+
+  assign mem_commit = ex_mem_reg.valid &&
+                      (
+                          (!ex_mem_reg.mem_read && !ex_mem_reg.mem_write) ||
+                          (ex_mem_reg.mem_read  && mem_response_valid)      ||
+                          (ex_mem_reg.mem_write && mem_transaction_done)
+                      );
+  logic mret_commit;
+  assign mret_commit = mem_commit && ex_mem_reg.is_mret && !ex_mem_reg.trap_valid;
+  logic instr_retired;
+  assign instr_retired = mem_commit && !ex_mem_reg.trap_valid;
+
+  always_comb begin
+    logic [7:0]  load_byte;
+    logic [15:0] load_half;
+    load_byte = mem_transaction_data >> (8 * ex_mem_reg.mem_addr[1:0]);
+    load_half = mem_transaction_data >> (16 * ex_mem_reg.mem_addr[1]);
+    mem_load_data = mem_transaction_data;
+    case (ex_mem_reg.mem_size)
+      MEM_SIZE_BYTE: begin
+        if (ex_mem_reg.mem_unsigned)
+          mem_load_data = {24'h0, load_byte};
+        else
+          mem_load_data = {{24{load_byte[7]}}, load_byte};
+      end
+      MEM_SIZE_HALF: begin
+        if (ex_mem_reg.mem_unsigned)
+          mem_load_data = {16'h0, load_half};
+        else
+          mem_load_data = {{16{load_half[15]}}, load_half};
+      end
+      default: mem_load_data = mem_transaction_data;
+    endcase
+  end
+
+  // MEM/WB
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      mem_wb_reg <= '0;
+    end else if (trap_flush) begin
+      mem_wb_reg.valid <= 1'b0;
+    end else if (mem_commit) begin
+      mem_wb_reg.valid     <= ex_mem_reg.valid && !ex_mem_reg.trap_valid;
+      mem_wb_reg.rd        <= ex_mem_reg.rd;
+      mem_wb_reg.reg_write <= ex_mem_reg.reg_write && !ex_mem_reg.trap_valid;
+      mem_wb_reg.wb_src    <= ex_mem_reg.wb_src;
+      mem_wb_reg.alu_result<= ex_mem_reg.alu_result;
+      mem_wb_reg.pc_plus4  <= ex_mem_reg.pc_plus4;
+      mem_wb_reg.csr_data  <= ex_mem_reg.csr_rdata;
+      if (ex_mem_reg.mem_read) begin
+        mem_wb_reg.mem_data <= mem_load_data;
+      end else
+        mem_wb_reg.mem_data <= ex_mem_reg.alu_result;
+    end else if (!stall_ex) begin
+      // If pipeline advances but we don't commit (e.g. bubble or non-memory instr that finished),
+      // we must invalidate mem_wb_reg or update it if it's a valid non-memory instr.
+      // Wait, non-memory instructions set mem_commit=1 immediately.
+      // So this branch is only taken if mem_commit=0.
+      // This implies ex_mem_reg is NOT valid, OR it is a memory instr waiting (but stall_ex=0??).
+      // If stall_ex=0, it means we are NOT waiting.
+      // So it must be invalid.
+      mem_wb_reg.valid <= 1'b0;
+    end
+  end
+
+  // CSR state update
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      csr_mstatus  <= 32'h0000_0000;
+      csr_mtvec    <= RESET_VECTOR;
+      csr_mepc     <= RESET_VECTOR;
+      csr_mcause   <= 32'h0;
+      csr_mtval    <= 32'h0;
+  csr_mscratch <= 32'h0;
+  csr_mie      <= 32'h0;
+  csr_mip      <= 32'h0;
+  csr_mcounteren <= 32'h0;
+      csr_mcycle   <= 32'h0;
+      csr_minstret <= 32'h0;
+    end else begin
+      csr_mcycle <= csr_mcycle + 32'd1;
+      if (instr_retired)
+        csr_minstret <= csr_minstret + 32'd1;
+
+      if (trap_request) begin
+        csr_mepc   <= trap_mepc_value;
+        csr_mcause <= trap_cause_value;
+        csr_mtval  <= trap_tval_value;
+        csr_mstatus<= csr_mstatus_trap_value;
+      end else if (mret_commit) begin
+        csr_mstatus<= csr_mstatus_mret_value;
+      end else if (ex_mem_reg.csr_en && ex_mem_reg.csr_write_en && mem_commit && !ex_mem_reg.trap_valid) begin
+        unique case (ex_mem_reg.csr_addr)
+          12'h300: csr_mstatus  <= ex_mem_reg.csr_wdata;
+          12'h304: csr_mie      <= ex_mem_reg.csr_wdata;
+          12'h305: csr_mtvec    <= ex_mem_reg.csr_wdata;
+          12'h306: csr_mcounteren <= ex_mem_reg.csr_wdata;
+          12'h340: csr_mscratch <= ex_mem_reg.csr_wdata;
+          12'h341: csr_mepc     <= ex_mem_reg.csr_wdata;
+          12'h342: csr_mcause   <= ex_mem_reg.csr_wdata;
+          12'h343: csr_mtval    <= ex_mem_reg.csr_wdata;
+          12'h344: csr_mip      <= ex_mem_reg.csr_wdata;
+          12'hB00: csr_mcycle   <= ex_mem_reg.csr_wdata;
+          12'hB02: csr_minstret <= ex_mem_reg.csr_wdata;
+          default: ;
+        endcase
+      end
+    end
+  end
+
+  // ------------------------------------------------------------
+  // Debug assignments
+  // ------------------------------------------------------------
+
+  assign dbg_pc    = if_id_reg.pc;
+  assign dbg_instr = if_id_reg.instr;
+
+  // ------------------------------------------------------------
+  // Helper functions
+  // ------------------------------------------------------------
+
+  function automatic logic [31:0] imm_i(input logic [31:0] instr);
+    imm_i = {{20{instr[31]}}, instr[31:20]};
+  endfunction
+
+  function automatic logic [31:0] imm_s(input logic [31:0] instr);
+    imm_s = {{20{instr[31]}}, instr[31:25], instr[11:7]};
+  endfunction
+
+  function automatic logic [31:0] imm_b(input logic [31:0] instr);
+    imm_b = {{19{instr[31]}}, instr[31], instr[7], instr[30:25], instr[11:8], 1'b0};
+  endfunction
+
+  function automatic logic [31:0] imm_u(input logic [31:0] instr);
+    imm_u = {instr[31:12], 12'h000};
+  endfunction
+
+  function automatic logic [31:0] imm_j(input logic [31:0] instr);
+    imm_j = {{11{instr[31]}}, instr[31], instr[19:12], instr[20], instr[30:21], 1'b0};
+  endfunction
+
+  function automatic logic [31:0] ctz32(input logic [31:0] value);
+    integer idx;
+    logic [31:0] result;
+    begin
+      result = 32;
+      for (idx = 0; idx < 32; idx = idx + 1) begin
+        if ((result == 32) && value[idx]) begin
+          result = idx;
+        end
+      end
+      ctz32 = result;
+    end
+  endfunction
+
+  function automatic logic csr_is_readonly(input logic [11:0] addr);
+    case (addr)
+      12'h301: csr_is_readonly = 1'b1;  // misa
+      12'hF11, 12'hF12, 12'hF13, 12'hF14: csr_is_readonly = 1'b1;  // vendor info
+      12'hC00, 12'hC01, 12'hC02: csr_is_readonly = 1'b1;  // cycle/time/instret (user view)
+      12'hB80, 12'hB82: csr_is_readonly = 1'b1;  // upper counters (not implemented)
+      default: csr_is_readonly = 1'b0;
+    endcase
+  endfunction
+
+  function automatic logic csr_legal(input logic [11:0] addr);
+    case (addr)
+      12'h300, 12'h301, 12'h304, 12'h305,
+      12'h306,
+      12'h340, 12'h341, 12'h342, 12'h343, 12'h344,
+      12'hB00, 12'hB02, 12'hB80, 12'hB82,
+      12'hC00, 12'hC01, 12'hC02,
+      12'hF11, 12'hF12, 12'hF13, 12'hF14: csr_legal = 1'b1;
+      default: csr_legal = 1'b0;
+    endcase
+  endfunction
+
+  function automatic logic [31:0] csr_read(input logic [11:0] addr);
+    case (addr)
+      12'h300: csr_read = csr_mstatus;
+      12'h301: csr_read = CSR_MISA_VALUE;
+      12'h304: csr_read = csr_mie;
+      12'h305: csr_read = csr_mtvec;
+      12'h306: csr_read = csr_mcounteren;
+      12'h340: csr_read = csr_mscratch;
+      12'h341: csr_read = csr_mepc;
+      12'h342: csr_read = csr_mcause;
+      12'h343: csr_read = csr_mtval;
+      12'h344: csr_read = csr_mip;
+      12'hB00: csr_read = csr_mcycle;
+      12'hB02: csr_read = csr_minstret;
+      12'hB80: csr_read = 32'h0;
+      12'hB82: csr_read = 32'h0;
+      12'hC00: csr_read = csr_mcycle;
+      12'hC01: csr_read = csr_mcycle;
+      12'hC02: csr_read = csr_minstret;
+      12'hF11: csr_read = 32'h0;  // mvendorid
+      12'hF12: csr_read = 32'h0;  // marchid
+      12'hF13: csr_read = 32'h0;  // mimpid
+      12'hF14: csr_read = 32'h0;  // mhartid
+      default: csr_read = 32'h0;
+    endcase
+  endfunction
+
+endmodule
+
+`default_nettype wire

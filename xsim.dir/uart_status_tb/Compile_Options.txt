@@ -1,0 +1,1 @@
+"uart_status_tb" -s "uart_status_tb" 
