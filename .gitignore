@@ -12,6 +12,18 @@ thinpad_top.ip_user_files/
 /.Xil
 /.Xilinx
 
+# Vivado simulation outputs
+xsim.dir/
+*.wdb
+*.pb
+
+# Python
+__pycache__/
+*.pyc
+
+# Backup files
+*.bak
+
 ref
 
 supervisor-rv

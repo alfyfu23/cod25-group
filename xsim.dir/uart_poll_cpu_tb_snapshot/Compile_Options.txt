@@ -1,1 +1,0 @@
--debug "typical" -top "uart_poll_cpu_tb" -snapshot "uart_poll_cpu_tb_snapshot" 
